@@ -174,11 +174,8 @@ func tcpBindHostPort(addr net.Addr) (host, port string) {
 	if ta, ok := addr.(*net.TCPAddr); ok {
 		switch {
 		case ta.IP == nil || ta.IP.IsUnspecified():
-			if ta.IP != nil && ta.IP.To4() == nil {
-				host = "[::]"
-			} else {
-				host = "0.0.0.0"
-			}
+			// Kernel may report [::] for a 0.0.0.0 bind (dual-stack); log one stable form for operators.
+			host = "0.0.0.0"
 		default:
 			host = ta.IP.String()
 			if ta.Zone != "" {
@@ -227,6 +224,9 @@ func printTable(entries []apiEntry) {
 }
 
 func main() {
+	// Railway (and similar) classify stderr as "error" level; route default logger to stdout for normal ops.
+	log.SetOutput(os.Stdout)
+
 	addr := flag.String("addr", defaultTCPAddr, "TCP listen address (overridden by MPOS_MOCK_TCP_ADDR; default + PORT -> 0.0.0.0:PORT for Railway)")
 	latencyFlag := flag.String("latency", "", "delay before each TCP response (e.g. 500ms, 2s). Empty uses MPOS_MOCK_LATENCY or 0")
 	httpAddr := flag.String("http", "", "optional HTTP listen address for GET / JSON API list (e.g. :8089)")
