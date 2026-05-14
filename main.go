@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -106,25 +107,49 @@ func detectCMD(payload string) string {
 // readRequest reads the client request bytes. The MPOS client keeps the connection open
 // for the reply, so we idle-timeout between reads instead of waiting for EOF.
 func readRequest(conn net.Conn, overall time.Duration) ([]byte, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(overall))
-	var buf strings.Builder
+	deadline := time.Now().Add(overall)
+	var buf bytes.Buffer
 	b := make([]byte, 8192)
-	idle := 80 * time.Millisecond
+	idle := 120 * time.Millisecond
+	const maxReqSize = 256 * 1024
+
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(idle))
+		if time.Now().After(deadline) {
+			if buf.Len() > 0 {
+				return buf.Bytes(), nil
+			}
+			return nil, os.ErrDeadlineExceeded
+		}
+
+		next := time.Now().Add(idle)
+		if next.After(deadline) {
+			next = deadline
+		}
+		_ = conn.SetReadDeadline(next)
+
 		n, err := conn.Read(b)
 		if n > 0 {
-			buf.Write(b[:n])
+			_, _ = buf.Write(b[:n])
+			payload := buf.Bytes()
+			if bytes.Contains(payload, []byte("[CMD]")) && bytes.HasSuffix(payload, []byte("##")) {
+				return payload, nil
+			}
+			if buf.Len() >= maxReqSize {
+				return payload, nil
+			}
 		}
+
 		if n == 0 && err == nil {
 			if buf.Len() > 0 {
-				return []byte(buf.String()), nil
+				return buf.Bytes(), nil
 			}
 			continue
 		}
+
 		if err != nil {
 			if buf.Len() > 0 {
-				return []byte(buf.String()), nil
+				// EOF / timeout after partial read should still be treated as a complete request.
+				return buf.Bytes(), nil
 			}
 			return nil, err
 		}
@@ -313,6 +338,7 @@ func handleConn(conn net.Conn, latency time.Duration) {
 	if latency > 0 {
 		time.Sleep(latency)
 	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(body)); err != nil {
 		log.Printf("write: %v", err)
 	}
