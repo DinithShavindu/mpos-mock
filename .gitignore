@@ -1,0 +1,5 @@
+# Local build artifacts
+mpos-mock
+mpos-mock-bin
+*.exe
+*.out
