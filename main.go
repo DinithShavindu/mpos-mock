@@ -110,7 +110,7 @@ func readRequest(conn net.Conn, overall time.Duration) ([]byte, error) {
 	deadline := time.Now().Add(overall)
 	var buf bytes.Buffer
 	b := make([]byte, 8192)
-	idle := 120 * time.Millisecond
+	idle := 500 * time.Millisecond
 	const maxReqSize = 256 * 1024
 
 	for {
@@ -147,6 +147,12 @@ func readRequest(conn net.Conn, overall time.Duration) ([]byte, error) {
 		}
 
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if buf.Len() > 0 {
+					return buf.Bytes(), nil
+				}
+				continue
+			}
 			if buf.Len() > 0 {
 				// EOF / timeout after partial read should still be treated as a complete request.
 				return buf.Bytes(), nil
@@ -324,7 +330,15 @@ func handleConn(conn net.Conn, latency time.Duration) {
 
 	req, err := readRequest(conn, 30*time.Second)
 	if err != nil {
-		log.Printf("read: %v", err)
+		log.Printf("read: %v (replying generic ACCEPTED)", err)
+		body := responseForCMD("")
+		if latency > 0 {
+			time.Sleep(latency)
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, writeErr := conn.Write([]byte(body)); writeErr != nil {
+			log.Printf("write fallback: %v", writeErr)
+		}
 		return
 	}
 	cmd := detectCMD(string(req))
