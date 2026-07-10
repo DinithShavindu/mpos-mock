@@ -162,6 +162,31 @@ func readRequest(conn net.Conn, overall time.Duration) ([]byte, error) {
 	}
 }
 
+// parseResetCMDs builds the set of CMDs whose connections are reset (TCP RST)
+// instead of answered, e.g. "ADDORDER" or "ADDORDER,GETORDERTTL". Flag wins over env.
+func parseResetCMDs(flagVal, envVal string) map[string]bool {
+	raw := strings.TrimSpace(flagVal)
+	if raw == "" {
+		raw = strings.TrimSpace(envVal)
+	}
+	set := make(map[string]bool)
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {
+			set[c] = true
+		}
+	}
+	return set
+}
+
+// abortConn closes the connection with SO_LINGER=0 so the kernel sends RST instead
+// of FIN; the client's pending read then fails with "connection reset by peer".
+func abortConn(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+	_ = conn.Close()
+}
+
 func parseLatency(flagVal, envVal string) (time.Duration, error) {
 	if strings.TrimSpace(flagVal) != "" {
 		return time.ParseDuration(strings.TrimSpace(flagVal))
@@ -261,12 +286,14 @@ func main() {
 	addr := flag.String("addr", defaultTCPAddr, "TCP listen address (overridden by MPOS_MOCK_TCP_ADDR; default + PORT -> 0.0.0.0:PORT for Railway)")
 	latencyFlag := flag.String("latency", "", "delay before each TCP response (e.g. 500ms, 2s). Empty uses MPOS_MOCK_LATENCY or 0")
 	httpAddr := flag.String("http", "", "optional HTTP listen address for GET / JSON API list (e.g. :8089)")
+	resetFlag := flag.String("reset-cmds", "", "comma-separated CMDs answered with a TCP reset instead of a response, e.g. ADDORDER (env: MPOS_MOCK_RESET_CMDS)")
 	flag.Parse()
 
 	latency, err := parseLatency(*latencyFlag, os.Getenv("MPOS_MOCK_LATENCY"))
 	if err != nil {
 		log.Fatalf("invalid latency: %v", err)
 	}
+	resetCMDs := parseResetCMDs(*resetFlag, os.Getenv("MPOS_MOCK_RESET_CMDS"))
 
 	startTime := time.Now().UTC()
 	tcpListenAddr := effectiveTCPListenAddr(*addr)
@@ -312,8 +339,8 @@ func main() {
 		log.Fatalf("TCP listen %q: %v", tcpListenAddr, err)
 	}
 	tcpHost, tcpPort := tcpBindHostPort(ln.Addr())
-	log.Printf("mpos-mock tcp_start service_start=%s tcp_host=%s tcp_port=%s bind_address=%q latency=%v%s",
-		startTime.Format(time.RFC3339Nano), tcpHost, tcpPort, tcpListenAddr, latency, railwayExtra)
+	log.Printf("mpos-mock tcp_start service_start=%s tcp_host=%s tcp_port=%s bind_address=%q latency=%v reset_cmds=%v%s",
+		startTime.Format(time.RFC3339Nano), tcpHost, tcpPort, tcpListenAddr, latency, resetKeys(resetCMDs), railwayExtra)
 
 	for {
 		conn, err := ln.Accept()
@@ -321,11 +348,19 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(conn, latency)
+		go handleConn(conn, latency, resetCMDs)
 	}
 }
 
-func handleConn(conn net.Conn, latency time.Duration) {
+func resetKeys(set map[string]bool) []string {
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func handleConn(conn net.Conn, latency time.Duration, resetCMDs map[string]bool) {
 	defer conn.Close()
 
 	req, err := readRequest(conn, 30*time.Second)
@@ -342,6 +377,14 @@ func handleConn(conn net.Conn, latency time.Duration) {
 		return
 	}
 	cmd := detectCMD(string(req))
+	if cmd != "" && resetCMDs[cmd] {
+		if latency > 0 {
+			time.Sleep(latency)
+		}
+		log.Printf("cmd=%s -> injecting TCP reset (connection reset by peer)", cmd)
+		abortConn(conn)
+		return
+	}
 	body := responseForCMD(cmd)
 	if cmd == "" {
 		log.Printf("unknown CMD in request (%d bytes), replying generic ACCEPTED", len(req))
